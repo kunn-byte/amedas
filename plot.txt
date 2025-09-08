@@ -1,0 +1,292 @@
+
+def find_nearest_grid_point(lat, lon, lat0, lon0):
+    """
+    緯度経度格子(lat, lon)上で、指定された緯度経度(lat0, lon0)に最も近い
+    格子点インデックス(i, j)を返す。
+
+    Parameters:
+        lat (2D ndarray): 緯度格子
+        lon (2D ndarray): 経度格子
+        lat0 (float): 対象の緯度
+        lon0 (float): 対象の経度
+
+    Returns:
+        (i, j): 最近傍格子点のインデックス
+    """
+    # 地球半径 [km]
+    R = 6371.0
+
+    # 緯度・経度をラジアンに変換
+    lat_rad = np.radians(lat)
+    lon_rad = np.radians(lon)
+    lat0_rad = np.radians(lat0)
+    lon0_rad = np.radians(lon0)
+
+    # 球面距離（Haversineでなく簡略化された球面余弦法）
+    dlat = lat_rad - lat0_rad
+    dlon = lon_rad - lon0_rad
+    a = np.sin(dlat/2)**2 + np.cos(lat_rad) * np.cos(lat0_rad) * np.sin(dlon/2)**2
+    distance = 2 * R * np.arcsin(np.sqrt(a))
+
+    # 最小距離のインデックスを取得
+    idx = np.unravel_index(np.argmin(distance), lat.shape)
+    #print(idx)
+    #print(lat0, lon0, lat[idx[0],idx[1]], lon[idx[0], idx[1]])
+    return idx
+
+
+def find_nearest_grid_point2(lon_or_lat, z, lon_or_lat0, z0):
+    """
+    (lon_or_lat, z) 格子において、(lon_or_lat0, z0) に最も近い点のインデックスを返す。
+    
+    単位:
+      - lon_or_lat, lon_or_lat0: degrees
+      - z, z0: meters
+
+    地球半径 R=6371km による球面上の距離を用いる（水平距離のみ球面考慮、鉛直距離は直線距離）。
+    
+    Returns:
+      iz, iy: 最も近い点のインデックス
+    """
+    # 地球半径 [m]
+    R = 6371000.0
+
+    # 緯度・経度をラジアンに
+    angle_rad = np.radians(lon_or_lat)
+    angle0_rad = np.radians(lon_or_lat0)
+
+    # 水平距離 [m]（球面上の弧長）
+    d_angle = angle_rad - angle0_rad
+    arc_length = R * d_angle
+
+    # 垂直距離
+    dz = z - z0
+
+    # 合成距離
+    dist = np.sqrt(arc_length**2 + dz**2)
+
+    # 最小距離インデックス
+    idx = np.unravel_index(np.argmin(dist), dist.shape)
+    return idx
+
+
+def get_zlev_data(data, z, z0):   
+    (ny, nx) = data.shape[-2:]
+    data0 = np.empty((ny,nx))
+    
+    for j in range(ny):
+        for i in range(nx):
+            try:
+                f = interp1d(z[:,j,i], data[:,j,i], bounds_error=True)
+                data0[j, i] = f(z0)
+            except:
+                data0[j,i] = np.nan
+
+    #print(data0.shape, np.nanmin(data0), np.nanmax(data0))
+    return data0
+
+def lambert_mapping(ax_range,lonlat_range,clon,clat,rlats):
+
+    proj = ccrs.LambertConformal(central_longitude=clon,     # ランベルト正角図法の中心経度
+                                 central_latitude=clat,       # 同中心緯度
+                                 standard_parallels=rlats)   # 同標準緯度２本
+    proj_cart = ccrs.PlateCarree()     
+
+    ax = plt.axes(ax_range,projection=proj)
+    ax.set_extent(lonlat_range,crs=proj_cart)    
+    
+    ax.coastlines(resolution='10m',linewidth=0.5)
+    ax.add_feature(cfeature.LAND.with_scale('10m'), color='#bbbbbb') # 陸を塗潰す
+    g = ax.gridlines(crs=proj_cart, linewidth=0.2,color="k", draw_labels=['right', 'bottom'], x_inline=False, y_inline=False)
+    g.xlocator = mticker.FixedLocator(np.arange(lonlat_range[0]-10,lonlat_range[1]+10,1)) # 経線は10度ごと
+    g.ylocator = mticker.FixedLocator(np.arange(lonlat_range[2]-10,lonlat_range[3]+10,1))    # 緯線は10度ごと
+    
+    return ax, proj, proj_cart
+
+
+###  矢印を書くのは千鳥格子(正方形の頂点および対角線の交点からなる模様)のような方が矢印が干渉しずらくてよい
+def stagger(m,n):
+    px, py = [], []
+    for kax in [0,0.05]:
+        for jax in np.arange(1/float(2*n)+kax,1,1/float(n)):
+            for iax in np.arange(1/float(2*m)+kax,1,1/float(m)):
+                px.append(iax)
+                py.append(jax)
+    return px, py
+
+def transform_figure_to_lonlat(p_on_fig,ax,proj,proj_cart,flush):
+    transform = proj_cart._as_mpl_transform(ax) 
+    p_on_pix = ax.transAxes.transform(p_on_fig) # figure座標-->pixel座標
+    p_on_dis = ax.transData.inverted().transform(p_on_pix)# pixel座標-->距離座標
+    p_on_lonlat = proj_cart.transform_point(*p_on_dis, src_crs=proj)# 距離座標-->緯度経度座標 
+    if flush:
+        print("\nFigure coordinate:(A,B)=({0:6.3f},{1:6.3f})".format(*p_on_fig))
+        print("Pixel  coordinate:(W,H)=({0:6.1f}px,{1:6.1f}px)".format(*p_on_pix))
+        print("Distance coordinate:(X,Y)=({0:8.1f}km,{1:8.1f}km)".format(*p_on_dis/1000))
+        print("Lon/Lat coordinate:(λ,φ)=({0:6.1f}deg,{1:6.1f}deg)".format(*p_on_lonlat))
+    return p_on_lonlat, p_on_dis, p_on_pix
+        
+def transform_lonlat_to_figure(p_on_lonlat,ax,proj,proj_cart,flush):
+    transform = proj_cart._as_mpl_transform(ax) 
+    p_on_dis = proj.transform_point(*p_on_lonlat,proj_cart)# 距離座標<--緯度経度座標 
+    p_on_pix = ax.transData.transform(p_on_dis)# pixel座標<--距離座標
+    p_on_fig = ax.transAxes.inverted().transform(p_on_pix)# figure座標<--pixel座標
+    if flush:
+        print("\nLon/Lat coordinate:(λ,φ)=({0:6.1f}deg,{1:6.1f}deg)".format(*p_on_lonlat))
+        print("Distance coordinate:(X,Y)=({0:8.1f}km,{1:8.1f}km)".format(p_on_dis[0]/1000,p_on_dis[1]/1000))
+        print("Pixel  coordinate:(W,H)=({0:6.1f}px,{1:6.1f}px)".format(*p_on_pix))
+        print("Figure coordinate:(A,B)=({0:6.3f},{1:6.3f})".format(*p_on_fig))
+    return p_on_fig, p_on_pix, p_on_dis
+
+### 指定された格子上の点にベクトルをプロットします。
+def plot_vectors(ax,proj,proj_cart,    # cartopyを使って定義したもの(synoptic_chart参照)
+                px,py,                # figure座標におけるベクトルを書く場所
+                x,y,u,v,              # 緯度経度座標で定義された(x,y)と(u,v)
+                factor,               # figure座標でよい塩梅になるように長さを調整する
+                ulimit):              # ベクトルを書く長さの下限(これ以下の風速はmask out)
+
+    for iax, jax in zip(px,py):
+        p_a = (iax,jax)               # 与えられたfigure座標におけるplot位置
+        lon0, lat0 = transform_figure_to_lonlat(p_a,ax,proj,proj_cart,False)[0]
+                                      # figure座標の位置を緯度経度に変換
+        iy,ix =find_nearest_grid_point(y, x, lat0, lon0)
+        q_a = transform_lonlat_to_figure((x[iy,ix],y[iy,ix]),ax,proj,proj_cart,False)[0]
+                                      # 緯度経度(x[ix],y[iy])点をfigure座標に変換(ほぼp_aと同じはず)
+        R1 = transform_figure_to_lonlat((q_a[0]-0.01,q_a[1]),ax,proj,proj_cart,False)[0]
+        R2 = transform_figure_to_lonlat((q_a[0]+0.01,q_a[1]),ax,proj,proj_cart,False)[0]
+                                      # figure座標点は東西南北の方向が左右上下とは異なるので
+                                      # figure座標位置の東西方向が緯度経度座標の東西方向から
+                                      # どのくらいずれているかを確認
+        angle = math.atan2(R2[1]-R1[1],R2[0]%360-R1[0]%360)  # 上記を角度に変換
+
+        U = u[iy,ix] / 2 * factor
+        V = v[iy,ix] / 2 * factor
+        uabs = np.sqrt(u[iy,ix]*u[iy,ix]+v[iy,ix]*v[iy,ix])  # 風速の計算
+
+        if uabs >= ulimit:
+            U, V = U * np.cos(angle) + V * np.sin(angle), -U * np.sin(angle) + V *np.cos(angle) 
+                                         # U, Vを上記で計算したangleで回転変換(U,V=をばらして2行で書いてはいけない)
+            x1, y1 = q_a[0] - U, q_a[1] - V 
+            x2, y2 = q_a[0] + U, q_a[1] + V                    
+            ax.annotate("",xy=(x2,y2),   # ベクトルの終点
+                        xytext=(x1,y1),  # ベクトルの始点(annotateは矢印を積極的に書く目的ではないので、こんな仕様に)
+                        xycoords="axes fraction", # figure座標で書くの意味
+                        arrowprops=dict(arrowstyle="->", lw=0.5, color="0.2",
+						shrinkA=0,shrinkB=0), # これがないと始点・終点が2ptだけ短くなる 
+                       )
+    return
+
+def plot_unit_vector(Ax,proj,proj_cart,
+                     px,py,              #参照ベクトルの位置(figure座標)
+                     u,v,factor,         #参照ベクトルの大きさ
+                     px_text,py_text,    #参照ベクトルに添える注意書きの場所(figure座標, py_textは負値許容)
+                     title):             #参照ベクトルに添える注意書き
+
+    u = factor*u/2
+    v = factor*v/2
+    x1, y1 = px - u, py - v 
+    x2, y2 = px + u, py + v    
+    Ax.annotate("",xy=(x2,y2),xytext=(x1,y1),xycoords="axes fraction",
+                 arrowprops=dict(arrowstyle="->", lw=0.5, color="k",shrinkA=0,shrinkB=0))    
+    Ax.text( px_text, py_text, title, transform=Ax.transAxes, ha = "center", va = "center", fontsize=10 )    
+
+    return
+
+def transform_figure_to_xy(p_on_fig,ax,flush):
+    p_on_pix = ax.transAxes.transform(p_on_fig)       # Axes座標 → pixel
+    p_on_xy = ax.transData.inverted().transform(p_on_pix)       # pixel → xy
+    if flush:
+        print("\nFigure coordinate:(A,B)=({0:6.3f},{1:6.3f})".format(*p_on_fig))
+        print("Pixel  coordinate:(W,H)=({0:6.1f}px,{1:6.1f}px)".format(*p_on_pix))
+        print("Data coordinate:(X,Y)=({0:8.1f}deg,{1:8.1f}km)".format(p_on_xy[0], p_on_xy[1]/1000))
+    return p_on_xy, p_on_pix
+        
+def transform_xy_to_figure(p_on_xy,ax,flush):
+    p_on_pix = ax.transData.transform(p_on_xy)          # Data → pixel
+    p_on_fig = ax.transAxes.inverted().transform(p_on_pix)    # pixel → Axes(Figure)座標
+    if flush:
+        print("Data coordinate:(X,Y)=({0:8.1f}deg,{1:8.1f}km)".format(p_on_dis[0],p_on_dis[1]/1000))
+        print("Pixel  coordinate:(W,H)=({0:6.1f}px,{1:6.1f}px)".format(*p_on_pix))
+        print("Figure coordinate:(A,B)=({0:6.3f},{1:6.3f})".format(*p_on_fig))
+    return p_on_fig, p_on_pix
+
+def plot_vectors2(ax,
+                px,py,                # figure座標におけるベクトルを書く場所
+                slice_lon_or_lat,
+                lon,lat,z,u,v,         # 緯度経度座標で定義された(x,y)と(u,v)
+                factor,               # figure座標でよい塩梅になるように長さを調整する
+                ulimit):              # ベクトルを書く長さの下限(これ以下の風速はmask out)
+
+    fig = plt.figure(figsize=(5.5,4),dpi=args.dpi)
+    ax2, proj, proj_cart = lambert_mapping((0.1,0.1,0.8,0.8),extent,args.clon,args.clat,(args.lat1, args.lat2))
+    
+    for iax, jax in zip(px,py):
+        p_a = (iax,jax)               # 与えられたfigure座標におけるplot位置
+        x0, y0 = transform_figure_to_xy(p_a,ax,False)[0]        
+
+        if slice_lon_or_lat == 'lon':
+            iy, ix = find_nearest_grid_point2(lat, z, x0, y0)
+            q_a = transform_xy_to_figure((lat[iy,ix],z[iy,ix]),ax,False)[0]
+            
+        elif slice_lon_or_lat == 'lat':
+            iy, ix = find_nearest_grid_point2(lon, z, x0, y0)
+            q_a = transform_xy_to_figure((lon[iy,ix],z[iy,ix]),ax,False)[0]
+            
+        U = u[iy,ix] / 2 * factor
+        V = v[iy,ix] / 2 * factor
+        uabs = np.sqrt(u[iy,ix]*u[iy,ix]+v[iy,ix]*v[iy,ix])  # 風速の計算
+
+        if uabs >= ulimit:
+            x1, y1 = q_a[0] - U, q_a[1] - V 
+            x2, y2 = q_a[0] + U, q_a[1] + V                    
+            ax.annotate("",xy=(x2,y2),   # ベクトルの終点
+                        xytext=(x1,y1),  # ベクトルの始点(annotateは矢印を積極的に書く目的ではないので、こんな仕様に)
+                        xycoords="axes fraction", # figure座標で書くの意味
+                        arrowprops=dict(arrowstyle="->", lw=0.5, color="0.2",
+						shrinkA=0,shrinkB=0), # これがないと始点・終点が2ptだけ短くなる 
+                       )
+    return ax
+
+def plot_unit_vector2(Ax,
+                     px,py,              #参照ベクトルの位置(figure座標)
+                     u,v,factor,         #参照ベクトルの大きさ
+                     px_text,py_text,    #参照ベクトルに添える注意書きの場所(figure座標, py_textは負値許容)
+                     title):             #参照ベクトルに添える注意書き
+
+    u = factor*u/2
+    v = factor*v/2
+    x1, y1 = px - u, py - v 
+    x2, y2 = px + u, py + v    
+    Ax.annotate("",xy=(x2,y2),xytext=(x1,y1),xycoords="axes fraction",
+                 arrowprops=dict(arrowstyle="->", lw=0.5, color="k",shrinkA=0,shrinkB=0))    
+    Ax.text( px_text, py_text, title, transform=Ax.transAxes, ha = "center", va = "center", fontsize=10 )    
+
+    return
+
+
+
+fig = plt.figure(figsize=(5.5,4),dpi=args.dpi)
+        ax, proj, proj_cart = lambert_mapping((0.1,0.1,0.8,0.8),extent,args.clon,args.clat,(args.lat1, args.lat2))
+
+        ax.plot(lon[by:-1*by, bx], lat[by:-1*by, bx], color="k", transform=proj_cart)
+        ax.plot(lon[by:-1*by, -1*bx], lat[by:-1*by, -1*bx], color="k", transform=proj_cart)
+        ax.plot(lon[by, bx:-1*bx], lat[by, bx:-1*bx], color="k", transform=proj_cart)
+        ax.plot(lon[-1*by, bx:-1*bx], lat[-1*by, bx:-1*bx], color="k", transform=proj_cart)   
+    
+        z0 = args.slice[1]
+        u0 = get_zlev_data(u[t_slice].reshape(u.shape[-3:]), z, z0)
+        v0 = get_zlev_data(v[t_slice].reshape(v.shape[-3:]), z, z0)
+        x = lon
+        y = lat
+
+        # plot
+        factor, ulimit = 0.005, 3
+        plot_vectors(ax,proj,proj_cart,*stagger(12,8),x,y,u0,v0,factor,ulimit)  # 縦横比1240:876にあわせた千鳥格子でベクトルプロット
+        #凡例
+        bbox = ax.get_position()
+        scale = (0.1/bbox.height)
+        ax2 = fig.add_axes([0.9, 0.1, bbox.width*scale, 0.1])
+        plot_unit_vector(ax2,proj,proj_cart,0,0.5,10/scale,0,factor,0,0,"10 m/s") #図下に西風10 m/s参照ベクトルをプロット
+        ax2.axis('off')
+
+        ax.set_title(dtimes[k].strftime(f"uv(m/s) at {args.slice[1]} m (%H:00 on %d %b %Y)"))
