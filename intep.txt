@@ -1,0 +1,142 @@
+import pandas as pd
+import numpy as np
+import datetime
+from dateutil.relativedelta import relativedelta
+import time
+import os
+from pykrige.ok import OrdinaryKriging
+from joblib import Parallel, delayed
+#from pyproj import Transformer
+
+
+def haversine(lat1, lon1, lat2, lon2, radius=6371000):
+    """
+    NumPyでハーバーサイン公式を計算(km)
+    lat1, lon1, lat2, lon2 は度単位（スカラー or ndarray）
+    radius: 地球半径 (m)
+    """
+    # ラジアンに変換
+    lat1 = np.radians(lat1)
+    lon1 = np.radians(lon1)
+    lat2 = np.radians(lat2)
+    lon2 = np.radians(lon2)
+
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+
+    a = np.sin(dlat/2.0)**2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon/2.0)**2
+    c = 2 * np.arcsin(np.sqrt(a))
+
+    return radius * c
+
+
+def fix_hour24(series):
+    series = series.astype(str)  # 念のため文字列化
+    mask = series.str.endswith("24")
+    
+    # 24時のデータを翌日の00:00に変換
+    fixed = pd.to_datetime(series.where(~mask, series.str[:8]), format="%Y%m%d%H", errors="coerce")
+    fixed[mask] = pd.to_datetime(series[mask].str[:8], format="%Y%m%d") + pd.Timedelta(days=1)
+    return fixed
+
+
+
+
+
+def read_data(start_date, end_date, extent, values):
+    path = '/mnt/meteo-hdd02/tkaneko/toshiba/data/'
+    obs_stations = pd.read_excel(path+"obs_stations.xlsx")
+    print(obs_stations.columns)
+    
+    #obs_stations = obs_stations[1:]
+    amd = pd.DataFrame()
+    
+    if extent is not None:
+        obs_stations = obs_stations[obs_stations['longitude']>extent[0]]
+        obs_stations = obs_stations[obs_stations['longitude']<extent[1]]
+        obs_stations = obs_stations[obs_stations['latitude']>extent[2]]
+        obs_stations = obs_stations[obs_stations['latitude']<extent[3]]
+    
+    for (idx, row) in obs_stations[1:11].iterrows():
+        print(row['station_name'])
+        lon, lat = row['longitude'], row['latitude']
+
+        tmps = pd.DataFrame()
+        date = datetime.datetime(start_date.year,start_date.month,1,0) 
+        while float(f'{date.year}{date.month}') <= float(f'{end_date.year}{end_date.month}'):
+            tmp = pd.read_csv(path+'%s/%s_%s_%s.csv'%(date.strftime('%Y%m'),row['station_id'],row['station_name'],date.strftime('%Y%m')))
+            tmp = tmp.rename(columns={'Unnamed: 0': 'date'})
+
+            tmp['name'] = np.tile(row['station_name'], (len(tmp)))
+            tmp['lon'] = np.tile(row['longitude'], (len(tmp)))
+            tmp['lat'] = np.tile(row['latitude'], (len(tmp)))
+
+            if values is not None:
+                tmp = tmp[['date', 'name', 'lon', 'lat'] + values]
+                       
+            tmps = pd.concat([tmps, tmp], axis=0, ignore_index=True)
+
+            #amd = amd[]
+            date += relativedelta(months=1)
+
+        tmps['date'] = pd.to_datetime(fix_hour24(tmps['date']), format='%Y%m%d%H')
+        tmps = tmps[tmps['date'] >= pd.to_datetime(start_date)]
+        tmps = tmps[tmps['date'] <= pd.to_datetime(end_date)]
+        tmps = tmps.reset_index(drop=True)
+        
+        #print(tmps)
+        #break
+        
+        amd = pd.concat([amd, tmps], axis=0, ignore_index=False)
+
+    #amd = amd.sort_values(by="date", ascending=True)
+    amd = amd.reset_index(drop=True)
+    print(amd)
+    return amd
+
+
+
+def top_n_closest(df, lon0, lat0, n):
+    """
+    DataFrame の 'lon','lat','date' から、
+    日付ごとに基準点 (lon0, lat0) に近い上位 n 点を返す
+    """
+    df = df.copy()
+    df["distance_km"] = df.apply(
+        lambda row: haversine(lat0, lon0, row["lat"], row["lon"]), axis=1
+    )
+    # 日付ごとに n 個抽出
+    return df.groupby("date", group_keys=False).apply(
+        lambda g: g.nsmallest(n, "distance_km")
+    )
+
+
+start_date=datetime.datetime(2020,1,2,3)
+end_date=datetime.datetime(2024,3,5,3)
+extent=None
+values=['WS_MEAN','WD_MEAN']
+amd = read_data(start_date, end_date, extent, values)
+
+amd2 = top_n_closest(df=amd, lon0=140., lat0=45., n=10)
+
+amd2 = amd2[amd2['WS_MEAN'] != -100]
+amd2 = amd2[amd2['WD_MEAN'] != -100]
+
+print(amd2)
+
+
+def krige_for_time(df_time, gridx, gridy):
+    """特定の時刻のデータでクリギング実行"""
+    from pykrige.ok import OrdinaryKriging
+    x, y, z = df_time["lon"], df_time["lat"], df_time["WS_MEAN"]
+    OK = OrdinaryKriging(x, y, z, variogram_model="spherical")
+    zgrid, _ = OK.execute("points", gridx, gridy)
+    return df_time["date"].iloc[0], zgrid
+
+
+gridx, gridy = [135.0], [35.0]
+
+results = Parallel(n_jobs=4)(delayed(krige_for_time)(df_t, gridx, gridy) for time, df_t in amd2.groupby("date"))
+# 結果を辞書にまとめる
+krige_results = {time: zgrid for time, zgrid in results}
+print(krige_results)
