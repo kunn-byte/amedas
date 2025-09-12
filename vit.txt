@@ -1,0 +1,490 @@
+import numpy as np
+
+def extract_patch(lon, lat, value, lon0, lat0, ykm, N, theta=0.0):
+    """
+    lon, lat, value: np.array
+    lon0, lat0: patch center
+    ykm: patch size (km)
+    N: number of points to output
+    theta: rotation angle in degrees
+    """
+    # ハーバーサイン簡易換算
+    R = 6371  # 地球半径 km
+    dlat = np.radians(lat - lat0)
+    dlon = np.radians(lon - lon0)
+    lat0_rad = np.radians(lat0)
+    
+    dx = R * dlon * np.cos(lat0_rad)
+    dy = R * dlat
+
+    # 回転
+    th = np.radians(theta)
+    x_rot = dx * np.cos(th) - dy * np.sin(th)
+    y_rot = dx * np.sin(th) + dy * np.cos(th)
+
+    # 領域内の点
+    mask = (np.abs(x_rot) <= ykm/2) & (np.abs(y_rot) <= ykm/2)
+    x_sel, y_sel, v_sel = x_rot[mask], y_rot[mask], value[mask]
+
+    # 固定サイズに調整
+    if len(v_sel) >= N:
+        idx = np.random.choice(len(v_sel), N, replace=False)
+    else:
+        idx = np.arange(len(v_sel))
+    x_out = x_sel[idx]
+    y_out = y_sel[idx]
+    v_out = v_sel[idx]
+
+    # 足りない場合は NaN でパディング
+    if len(v_out) < N:
+        pad_len = N - len(v_out)
+        x_out = np.pad(x_out, (0, pad_len), constant_values=np.nan)
+        y_out = np.pad(y_out, (0, pad_len), constant_values=np.nan)
+        v_out = np.pad(v_out, (0, pad_len), constant_values=np.nan)
+
+    return np.stack([x_out, y_out, v_out], axis=1)  # shape = (N,3)
+
+
+
+import numpy as np
+import pandas as pd
+
+# サンプルデータ
+lon = np.random.rand(1000)*0.01 + 139.0
+lat = np.random.rand(1000)*0.01 + 35.0
+value = np.random.randint(0, 5, size=1000)
+df = pd.DataFrame({'lon': lon, 'lat': lat, 'value': value})
+
+# 250m ≈ 0.00225度（東京周辺換算）
+grid_size = 0.00225
+df['x_bin'] = np.floor((df['lon'] - df['lon'].min()) / grid_size).astype(int)
+df['y_bin'] = np.floor((df['lat'] - df['lat'].min()) / grid_size).astype(int)
+
+# グリッドごとの代表点（最頻値を value として選択）
+grid_df = df.groupby(['x_bin','y_bin']).agg(
+    lon=('lon','mean'),   # 代表座標としてグリッド内平均
+    lat=('lat','mean'),
+    value=('value', lambda x: x.mode()[0])  # 最頻値
+).reset_index()
+
+
+
+
+
+
+
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.optim import lr_scheduler
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.model_selection import train_test_split
+import gc
+import random
+import math
+import datetime
+
+######
+
+
+# VAEモデルの定義
+class VAE(nn.Module):
+    def __init__(self, input_dim, output_dim, hidden_dim, latent_dim):
+        super(VAE, self).__init__()
+        self.fc1 = nn.Linear(input_dim, hidden_dim) 
+        self.fc21 = nn.Linear(hidden_dim, latent_dim)    # 潜在変数の平均
+        self.fc22 = nn.Linear(hidden_dim, latent_dim)   # 潜在変数の対数分散
+        self.fc3 = nn.Linear(latent_dim, hidden_dim)
+        self.fc4 = nn.Linear(hidden_dim, output_dim)
+        self.relu = nn.ReLU()
+        self.sigmoid = nn.Sigmoid()
+
+    def encode(self, x):
+        h1 = self.relu(self.fc1(x))
+        return self.fc21(h1), self.fc22(h1)
+
+    def reparameterize(self, mu, logvar):
+        std = torch.exp(0.5*logvar)
+        eps = torch.randn_like(std)
+        return mu + eps*std
+
+    def decode(self, z):
+        h2 = self.relu(self.fc3(z))
+        return self.sigmoid(self.fc4(h2))
+
+    def forward(self, x):
+        mu, logvar = self.encode(x)
+        z = self.reparameterize(mu, logvar)
+        return self.decode(z), mu, logvar
+
+# VAEの損失関数
+def loss_function(recon_x, x, mu, logvar):
+    BCE = nn.functional.binary_cross_entropy(recon_x, x, reduction='sum')
+    KLD = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+    return BCE + KLD, BCE, KLD
+
+
+####################################################################################################
+
+"""
+
+入力
+2006‐2022年msm 31*31
+2006‐2022年radar/AMeDAS 186*156
+
+モデル説明
+
+Encoder 
+31*31=961
+700
+500
+
+Decoder 
+500
+5000
+186*156=29016
+"""
+#####################################################################################################
+
+
+homedir = "./"
+filedir = "../../downsample/"
+name = "vae"
+
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(device)
+
+scaler_A = torch.load(filedir+"scaler.ckpt")
+
+########################################################################################################
+#データ準備
+########################################################################################################
+def filter(x):
+    l = np.where(x>=1.)[0]
+    u, counts = np.unique(l, return_counts=True)
+    print(len(u), len(counts))
+    print(u)
+    print(counts/(x.shape[1]*x.shape[2]))
+    l = np.where(counts/(x.shape[1]*x.shape[2]) >= 0.2)
+    return l
+
+def data_load(path, y_s, y_e):
+    for i, y in enumerate(range(y_s, y_e)):
+        data_A_e = np.load(path+f"{y}.npy", allow_pickle=True)
+        if i == 0:
+            data_A = np.zeros((1,data_A_e.shape[1], data_A_e.shape[2]))
+        data_A = np.append(data_A, data_A_e, axis=0)
+        print(y)
+
+    data_A = np.delete(data_A, 0, axis=0)
+
+    print(np.min(data_A), np.max(data_A))
+    print(data_A.shape)
+    """
+    print('filter')
+    data_A = data_A[l]
+    """
+    return data_A
+
+# データの準備
+def prepare_data(dataset_A, dataset_B, scaler_A):
+
+    # データセットAのスケーリング
+    dataset_A_flat = dataset_A.reshape(-1, 1)
+    dataset_A_scaled = scaler_A.transform(dataset_A_flat).reshape(dataset_A.shape)
+    
+    # データセットBのスケーリング
+    dataset_B_flat = dataset_B.reshape(-1, 1)
+    dataset_B_scaled = scaler_A.transform(dataset_B_flat).reshape(dataset_B.shape)
+
+    # テンソルに変換
+    dataset_A_tensor = torch.tensor(dataset_A_scaled, dtype=torch.float32).reshape(-1, dataset_A.shape[1]*dataset_A.shape[2])
+    
+    dataset_B_tensor = torch.tensor(dataset_B_scaled, dtype=torch.float32).reshape(-1, dataset_B.shape[1]*dataset_B.shape[2])
+
+    return dataset_A_tensor, dataset_B_tensor
+
+#################################################################
+# データセットの準備
+
+np.random.seed(0)
+torch.manual_seed(0)
+
+dataset_A = data_load(filedir+f"tohoku5_radar_downmax_", 2006, 2023) #np.log1p
+dataset_A = np.append(dataset_A, data_load(filedir+f"tohoku5_radar_downmean_", 2006, 2023), axis=0)
+#dataset_B = data_load(filedir+f"tohoku5_radar") #np.log1p(rains_radar2)
+dataset_B = dataset_A 
+
+# データのスケーリングと変換
+dataset_A_tensor, dataset_B_tensor = prepare_data(dataset_A, dataset_B, scaler_A)
+
+# テンソルの形状確認
+print(f'dataset_A_tensor shape: {dataset_A_tensor.shape}')
+print(f'dataset_B_tensor shape: {dataset_B_tensor.shape}')
+print(torch.min(dataset_A_tensor), torch.max(dataset_A_tensor), torch.min(dataset_B_tensor), torch.max(dataset_B_tensor))
+
+# データサイズの取得
+input_dim = dataset_A_tensor.shape[1]  # データセットAのサイズ
+output_dim = dataset_B_tensor.shape[1]  # データセットBのフラット化されたサイズ
+
+print(f'input_dim: {input_dim}, output_dim: {output_dim}')
+
+# データローダーの準備
+train_dataset = torch.utils.data.TensorDataset(dataset_A_tensor, dataset_B_tensor)
+
+
+##################################
+
+dataset_A = data_load(filedir+f"tohoku5_radar_downmax_", 2023, 2024) #np.log1p(rains_msm2)
+dataset_A = np.append(dataset_A, data_load(filedir+f"tohoku5_radar_downmean_", 2023, 2024), axis=0)
+#dataset_B = data_load(filedir+f"tohoku5_radar") #np.log1p(rains_radar2)
+dataset_B = dataset_A 
+
+# データのスケーリングと変換
+dataset_A_tensor, dataset_B_tensor = prepare_data(dataset_A, dataset_B, scaler_A)
+
+# テンソルの形状確認
+print(f'dataset_A_tensor shape: {dataset_A_tensor.shape}')
+print(f'dataset_B_tensor shape: {dataset_B_tensor.shape}')
+print(torch.min(dataset_A_tensor), torch.max(dataset_A_tensor), torch.min(dataset_B_tensor), torch.max(dataset_B_tensor))
+
+# データローダーの準備
+test_dataset = torch.utils.data.TensorDataset(dataset_A_tensor, dataset_B_tensor)
+      
+print(len(train_dataset), len(test_dataset))
+
+###################################################################################################
+#学習
+
+# 学習
+def train_vae(model, train_loader, optimizer):
+    model.train()
+    train_loss = 0
+    train_bce, train_kld = 0, 0
+    for i, batch in enumerate(train_loader):
+        #print(i)
+        data_A, data_B = batch
+        data_A = data_A.to(device)
+        data_B = data_B.to(device)
+        optimizer.zero_grad()
+        recon_batch, mu, logvar = model(data_A)
+        loss, bce, kld = loss_function(recon_batch, data_B, mu, logvar)
+        loss.backward()
+        train_loss += loss.detach()
+        train_bce += bce.detach()
+        train_kld += kld.detach()
+        optimizer.step()
+    return train_loss/len(train_loader), train_bce/len(train_loader), train_kld/len(train_loader)
+
+def val_vae(model, test_loader):
+    model.eval()
+    test_loss = 0
+    test_bce, test_kld = 0,0
+    with torch.no_grad():
+        for i, batch in enumerate(test_loader):
+            data_A, data_B = batch
+            data_A = data_A.to(device)
+            data_B = data_B.to(device)
+            recon_batch, mu, logvar = model(data_A)
+            loss, bce, kld = loss_function(recon_batch, data_B, mu, logvar)
+            test_loss += loss.detach()
+            test_bce += bce.detach()
+            test_kld += kld.detach()
+    return test_loss/len(test_loader), test_bce/len(test_loader), test_kld/len(test_loader)
+###################################################################################################
+
+# ハイパーパラメータ
+batch_size = 256
+learning_rate = 1e-3
+num_epochs = 300
+
+input_dim = 31*31
+output_dim = 186*156
+hidden_dim = 500
+latent_dim = 100
+model = VAE(input_dim, output_dim, hidden_dim, latent_dim).to(device)
+optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+#step_scheduler = lr_scheduler.StepLR(optimizer, step_size=20, gamma=0.9)
+trainloss_history = []
+valloss_history = []
+
+
+# 学習
+print('train')
+for epoch in range(num_epochs):
+    ut1 = datetime.datetime.now()
+    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=12)
+    val_loader = torch.utils.data.DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=12)
+    train_loss, train_bce, train_kld = train_vae(model, train_loader, optimizer)
+    val_loss, val_bce, val_kld = val_vae(model, val_loader)
+    trainloss_history.append(train_loss)
+    valloss_history.append(val_loss)
+    #step_scheduler.step()
+    ut2 = datetime.datetime.now()
+    dt = ut2-ut1
+    print('{}/{}, train_loss: {:.2f}, val_loss: {:.2f}, -- {:.4f},{:.4f}/{:.4f},{:.4f}, -- {}'.format(epoch+1, num_epochs, train_loss, val_loss, train_bce, train_kld, val_bce, val_kld, ut2+dt*(num_epochs-epoch+1)))
+
+    # モデルの保存
+    if (epoch+1) % 50 == 0:
+        torch.save(
+            {
+            "input_dim": input_dim,
+            "output_dim": output_dim,
+            "hidden_dim": hidden_dim,
+            "latent_dim": latent_dim,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            #"step_scheduler_state_dict": step_scheduler.state_dict(),
+            "trainloss_history": trainloss_history,
+            "valloss_history": valloss_history,
+            },
+            homedir+f"/model_{name}.ckpt",
+            )
+        print("save", epoch+1)
+
+
+
+
+import torch
+from torch import nn
+
+from einops import rearrange, repeat
+from einops.layers.torch import Rearrange
+
+# helpers
+
+def pair(t):
+    return t if isinstance(t, tuple) else (t, t)
+
+# classes
+
+class FeedForward(nn.Module):
+    def __init__(self, dim, hidden_dim, dropout = 0.):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.Linear(dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, dim),
+            nn.Dropout(dropout)
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+class Attention(nn.Module):
+    def __init__(self, dim, heads = 8, dim_head = 64, dropout = 0.):
+        super().__init__()
+        inner_dim = dim_head *  heads
+        project_out = not (heads == 1 and dim_head == dim)
+
+        self.heads = heads
+        self.scale = dim_head ** -0.5
+
+        self.norm = nn.LayerNorm(dim)
+
+        self.attend = nn.Softmax(dim = -1)
+        self.dropout = nn.Dropout(dropout)
+
+        self.to_qkv = nn.Linear(dim, inner_dim * 3, bias = False)
+
+        self.to_out = nn.Sequential(
+            nn.Linear(inner_dim, dim),
+            nn.Dropout(dropout)
+        ) if project_out else nn.Identity()
+
+    def forward(self, x):
+        x = self.norm(x)
+
+        qkv = self.to_qkv(x).chunk(3, dim = -1)
+        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = self.heads), qkv)
+
+        dots = torch.matmul(q, k.transpose(-1, -2)) * self.scale
+
+        attn = self.attend(dots)
+        attn = self.dropout(attn)
+
+        out = torch.matmul(attn, v)
+        out = rearrange(out, 'b h n d -> b n (h d)')
+        return self.to_out(out)
+
+class Transformer(nn.Module):
+    def __init__(self, dim, depth, heads, dim_head, mlp_dim, dropout = 0.):
+        super().__init__()
+        self.norm = nn.LayerNorm(dim)
+        self.layers = nn.ModuleList([])
+        for _ in range(depth):
+            self.layers.append(nn.ModuleList([
+                Attention(dim, heads = heads, dim_head = dim_head, dropout = dropout),
+                FeedForward(dim, mlp_dim, dropout = dropout)
+            ]))
+
+    def forward(self, x):
+        for attn, ff in self.layers:
+            x = attn(x) + x
+            x = ff(x) + x
+
+        return self.norm(x)
+
+class ViT(nn.Module):
+    def __init__(self, *, image_size, patch_size, num_classes, dim, depth, heads, mlp_dim, pool = 'cls', channels = 3, dim_head = 64, dropout = 0., emb_dropout = 0.):
+        super().__init__()
+        image_height, image_width = pair(image_size)
+        patch_height, patch_width = pair(patch_size)
+
+        assert image_height % patch_height == 0 and image_width % patch_width == 0, 'Image dimensions must be divisible by the patch size.'
+
+        num_patches = (image_height // patch_height) * (image_width // patch_width)
+        patch_dim = channels * patch_height * patch_width
+        assert pool in {'cls', 'mean'}, 'pool type must be either cls (cls token) or mean (mean pooling)'
+
+        self.to_patch_embedding = nn.Sequential(
+            Rearrange('b c (h p1) (w p2) -> b (h w) (p1 p2 c)', p1 = patch_height, p2 = patch_width),
+            nn.LayerNorm(patch_dim),
+            nn.Linear(patch_dim, dim),
+            nn.LayerNorm(dim),
+        )
+
+        self.pos_embedding = nn.Parameter(torch.randn(1, num_patches + 1, dim))
+        self.cls_token = nn.Parameter(torch.randn(1, 1, dim))
+        self.dropout = nn.Dropout(emb_dropout)
+
+        self.transformer = Transformer(dim, depth, heads, dim_head, mlp_dim, dropout)
+
+        self.pool = pool
+        self.to_latent = nn.Identity()
+
+        self.mlp_head = nn.Linear(dim, num_classes)
+
+    def forward(self, img):
+        x = self.to_patch_embedding(img)
+        print(x.shape)
+        b, n, _ = x.shape
+
+        cls_tokens = repeat(self.cls_token, '1 1 d -> b 1 d', b = b)
+        x = torch.cat((cls_tokens, x), dim=1)
+        print(x.shape)
+        x += self.pos_embedding[:, :(n + 1)]
+        x = self.dropout(x)
+        print(x.shape)
+
+        x = self.transformer(x)
+        print(x.shape)
+
+        x = x.mean(dim = 1) if self.pool == 'mean' else x[:, 0]
+        print(x.shape)
+
+        x = self.to_latent(x)
+        print(x.shape)
+        return self.mlp_head(x)
+
+if __name__ == "__main__":
+    vit = ViT(image_size=(64,64), patch_size=(4,4), num_classes=2, dim=256, depth=4, heads=8, mlp_dim=512, pool='cls', channels=3, dim_head=64, dropout=0.1, emb_dropout=0.1)
+    a = torch.randn((2,3,64,64))
+    print(a.shape)
+    a = vit(a)
+    print(a.shape)
