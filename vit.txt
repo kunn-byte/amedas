@@ -1,5 +1,50 @@
 import numpy as np
 import pandas as pd
+from scipy.stats import mode
+
+def resample_to_coarse(lon1, lat1, value1, lon2, lat2):
+    """
+    細かい1次元データ (lon1, lat1, value1) を
+    粗い格子点 (lon2, lat2) に対応させ、最頻値で変換
+
+    Parameters
+    ----------
+    lon1, lat1 : array-like
+        細かい格子の座標
+    value1 : array-like
+        細かい格子の値（カテゴリ）
+    lon2, lat2 : array-like
+        粗い格子の座標（セル中心）
+
+    Returns
+    -------
+    coarse_values : ndarray shape (len(lon2), len(lat2))
+        粗い格子ごとの代表値（最頻値）
+    """
+    df = pd.DataFrame({"lon": lon1, "lat": lat1, "value": value1})
+
+    dlon = np.diff(np.sort(np.unique(lon2)))[0]
+    dlat = np.diff(np.sort(np.unique(lat2)))[0]
+
+    # 粗い格子の index を割り当て
+    df["i"] = ((df["lon"] - lon2.min()) / dlon).round().astype(int)
+    df["j"] = ((df["lat"] - lat2.min()) / dlat).round().astype(int)
+
+    # 各 (i,j) の最頻値
+    grouped = df.groupby(["i", "j"])["value"].agg(lambda x: mode(x, keepdims=False).mode)
+
+    # 出力配列
+    coarse_values = np.full((len(lon2), len(lat2)), np.nan, dtype=float)
+    for (i, j), val in grouped.items():
+        if 0 <= i < len(lon2) and 0 <= j < len(lat2):
+            coarse_values[i, j] = val
+
+    return coarse_values
+
+
+
+import numpy as np
+import pandas as pd
 
 def estimate_grid_spacing(lons, lats):
     """
