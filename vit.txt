@@ -1,4 +1,31 @@
 import numpy as np
+import pandas as pd
+
+def estimate_grid_spacing(lons, lats):
+    """
+    lon, lat の1次元配列から格子幅を推定
+    出力は (d_lon, d_lat)
+    """
+    # ソートして隣接差を計算
+    dlon = np.diff(np.sort(np.unique(lons)))
+    dlat = np.diff(np.sort(np.unique(lats)))
+
+    # 最頻値（mode）または中央値を代表値とする
+    grid_lon = pd.Series(dlon).mode().iloc[0] if len(dlon)>0 else None
+    grid_lat = pd.Series(dlat).mode().iloc[0] if len(dlat)>0 else None
+
+    return grid_lon, grid_lat
+
+def deg_to_km(dlon, dlat, lat0):
+    R = 6371.0  # 地球半径 (km)
+    dx = dlon * (np.pi/180) * R * np.cos(np.radians(lat0))  # 経度方向
+    dy = dlat * (np.pi/180) * R                             # 緯度方向
+    return dx, dy
+
+
+
+
+import numpy as np
 
 def extract_patch(lon, lat, value, lon0, lat0, ykm, N, theta=0.0):
     """
