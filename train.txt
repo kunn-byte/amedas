@@ -1,0 +1,199 @@
+
+
+
+#################################################################
+# データセットの準備
+
+np.random.seed(0)
+torch.manual_seed(0)
+
+
+# テンソルに変換
+dataset_A_tensor = torch.tensor(dataset_A_scaled, dtype=torch.float32).reshape(-1, dataset_A.shape[1]*dataset_A.shape[2])
+torch.tensor(dataset_B_scaled, dtype=torch.float32).reshape(-1, dataset_B.shape[1]*dataset_B.shape[2])
+
+# データローダーの準備
+train_dataset = torch.utils.data.TensorDataset(dataset_A_tensor, dataset_B_tensor)
+
+###################################################################################################
+# 学習
+def train(model, train_loader, optimizer):
+    model.train()
+    train_loss = 0
+    for i, batch in enumerate(train_loader):
+        #print(i)
+        data_A, data_B = batch
+        data_A = data_A.to(device)
+        data_B = data_B.to(device)
+        optimizer.zero_grad()
+        recon_batch = model(data_A)
+        loss = loss_function(recon_batch, data_B)
+        loss.backward()
+        train_loss += loss.detach()
+        optimizer.step()
+    return train_loss/len(train_loader)
+
+def val(model, test_loader):
+    model.eval()
+    test_loss = 0
+    with torch.no_grad():
+        for i, batch in enumerate(test_loader):
+            data_A, data_B = batch
+            data_A = data_A.to(device)
+            data_B = data_B.to(device)
+            recon_batch = model(data_A)
+            loss = loss_function(recon_batch, data_B)
+            test_loss += loss.detach()
+    return test_loss/len(test_loader)
+###################################################################################################
+
+# ハイパーパラメータ
+batch_size = 256
+learning_rate = 1e-3
+num_epochs = 300
+
+input_dim = 31*31
+output_dim = 186*156
+hidden_dim = 500
+latent_dim = 100
+
+model = ViT()
+
+# VAEの損失関数
+def loss_function(recon_x, x):
+    BCE = nn.functional.binary_cross_entropy(recon_x, x, reduction='sum')
+    return BCE
+
+optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+#step_scheduler = lr_scheduler.StepLR(optimizer, step_size=20, gamma=0.9)
+trainloss_history = []
+valloss_history = []
+
+
+# 学習
+print('train')
+for epoch in tqdm(range(num_epochs)):
+    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=12)
+    val_loader = torch.utils.data.DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=12)
+    train_loss = train_vae(model, train_loader, optimizer)
+    val_loss = val_vae(model, val_loader)
+    trainloss_history.append(train_loss)
+    valloss_history.append(val_loss)
+    #step_scheduler.step()
+    print('{}/{}, train_loss: {:.2f}, val_loss: {:.2f}'.format(epoch+1, num_epochs, train_loss, val_loss))
+
+    # モデルの保存
+    if (epoch+1) % 50 == 0:
+        torch.save(
+            {
+            "input_dim": input_dim,
+            "output_dim": output_dim,
+            "hidden_dim": hidden_dim,
+            "latent_dim": latent_dim,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            #"step_scheduler_state_dict": step_scheduler.state_dict(),
+            "trainloss_history": trainloss_history,
+            "valloss_history": valloss_history,
+            },
+            homedir+f"/model_{name}.ckpt",
+            )
+        print("save", epoch+1)
+
+
+
+
+
+
+
+
+
+
+def scaler_lnd(df):
+    scaler = {
+        '0100': 0.7, #田
+        '0200': 0.7, #その他の農用地
+        '0500': 0.5, #森林
+        '0600': 0.8, #荒地
+        '0701': 0.1, #中高層建物
+        '0702': 0.2, #工場
+        '0703': 0.3, #低層建物（非密集地）
+        '0704': 0.3, #低層建物（密集地）
+        '0901': 0.5, #道路
+        '0902': 0.5, #鉄道
+        '1001': 0.4, #施設等用地
+        '1002': 0.8, #空地
+        '1003': 0.8, #公園・緑地
+        '1100': 0.9, #河川地及び湖沼
+        '1400': 1., #海浜
+        '1500': 1., #海水域
+        '1600': 0.8, #ゴルフ場
+        '0000': 0., #解析範囲外
+
+}
+    return df.map(scaler)
+
+
+def scaler(data, minmax=None):
+    if minmax is None:
+        minmax = [np.min(data), np.max(data)]
+    data_scaled = ( data - minmax[0] ) / ( minmax[1] - minmax[0])
+    return data_scaled, minmax
+
+
+
+def scaler_dirction(data):
+    rad = np.deg2rad(data)
+    x = np.cos(rad)
+    y = np.sin(rad)
+    # [-1,1] → [0,1] に変換
+    x01 = (x + 1) / 2
+    y01 = (y + 1) / 2
+    return x01, y01
+
+
+
+def relative_position(lon1, lat1, lon2, lat2, R=6371.0):
+    """
+    lon1, lat1: 相対位置を求めたい点
+    lon2, lat2: 基準点
+    Returns:
+        x01, y01 : np.ndarray in [0,1], 
+                   lon1,lat1 が lon2,lat2 から見てどこにあるかを表す
+                   北=(0.5,1), 東=(1,0.5), 南=(0.5,0), 西=(0,0.5)
+    """
+    lon1 = np.asarray(lon1, dtype=float)
+    lat1 = np.asarray(lat1, dtype=float)
+    lon2 = np.asarray(lon2, dtype=float)
+    lat2 = np.asarray(lat2, dtype=float)
+    lon1, lat1, lon2, lat2 = np.broadcast_arrays(lon1, lat1, lon2, lat2)
+
+    # ラジアン
+    phi1 = np.radians(lat1)
+    phi2 = np.radians(lat2)
+    lam1 = np.radians(lon1)
+    lam2 = np.radians(lon2)
+    dphi = phi2 - phi1
+    dlam = lam1 - lam2
+
+    # haversine distance
+    a = np.sin(dphi / 2.0)**2 + np.cos(phi1) * np.cos(phi2) * np.sin(dlam / 2.0)**2
+    a = np.clip(a, 0.0, 1.0)
+    c = 2 * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
+    r_km = R * c
+
+    # 方位角 θ (基準点から目的点へ)
+    y = np.sin(dlam) * np.cos(phi1)
+    x = np.cos(phi2) * np.sin(phi1) - np.sin(phi2) * np.cos(phi1) * np.cos(dlam)
+    theta = np.degrees(np.arctan2(y, x))
+    bearing_deg = (theta + 360) % 360  # 0..360
+
+    # 単位ベクトルに変換
+    vx = np.cos(np.radians(bearing_deg))
+    vy = np.sin(np.radians(bearing_deg))
+
+    # [0,1]に正規化
+    x01 = (vx + 1) / 2
+    y01 = (vy + 1) / 2
+
+    return r_km, x01, y01
