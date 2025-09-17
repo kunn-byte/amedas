@@ -1,0 +1,163 @@
+from google.colab import drive
+drive.mount('/content/drive/')
+
+! pip install geopandas
+! pip install rasterio
+
+
+from zipfile import ZipFile
+from io import BytesIO
+import geopandas as gpd
+import pandas as pd
+import numpy as np
+import os
+import glob
+from tqdm import tqdm
+
+import rasterio
+from rasterio.transform import from_origin
+from rasterio import features
+
+
+from scipy.interpolate import griddata
+# 約1km 0.010度×0.0125度 → 250m 0.0025度×0.003125度
+
+dx = 0.0025
+dy = 0.003125
+grid_lon = np.arange(lon_min, lon_max+dx, dx)
+grid_lat = np.arange(lat_min, lat_max+dy, dy)
+lon2d, lat2d = np.meshgrid(grid_lon, grid_lat)
+
+# 補間して格子に展開
+grid_value = griddata(lon,lat), values, (lon2d, lat2d), method="linear", fill_value=)
+
+
+def raster(zip_file_path, value_list, dtype_list, shape=None, transform=None):
+    path_list = glob.glob(zip_file_path)
+
+    gdfs = []
+    for path in tqdm(path_list):
+        zf = ZipFile(path)
+        shp = [f for f in zf.namelist() if f.endswith(".shp")]
+        gdf = gpd.read_file("zip://"+path+"/"+shp[0])
+        # EPSG:4612 → JGD2000 / (B, L) （地理座標系、2D: lon, lat）
+        # EPSG:6697 → JGD2011 / (B, L)
+
+        gdf.crs = "EPSG:4612"
+        gdf = gdf.replace("unknown", np.nan)
+        gdfs.append(gdf)
+        #print(gdf.columns)
+
+    gdf_all = gpd.GeoDataFrame(pd.concat(gdfs, ignore_index=True))
+
+    bounds = gdf_all.total_bounds  # 全データの範囲 [minx, miny, maxx, maxy]
+    xmin, ymin, xmax, ymax = bounds
+    print(xmin, ymin, xmax, ymax)
+
+    if shape is not None:
+        width, height = shape
+    else:
+        dx = 0.0025
+        dy = 0.003125
+        width = int((xmax - xmin) / dx)
+        height = int((ymax - ymin) / dy)
+        print(height, width)
+
+        transform = from_origin(xmin, ymax, dx, dy)
+
+    raster_list = []
+    for value, dtype in zip(value_list, dtype_list):
+        gdf_all[value] = gdf_all[value].astype(dtype)
+        # 各ポリゴンに土地利用コードを割り当てる
+        shapes = ((geom, val) for geom, val in zip(gdf_all.geometry, gdf_all[value]))
+
+        raster = features.rasterize(
+            shapes=shapes,
+            out_shape=(height, width),
+            transform=transform,
+            fill=0,        # 空白部分は0
+            dtype=dtype
+            )
+        print(raster.shape)
+        raster_list.append(raster)
+    return raster_list
+
+
+
+
+path = "/content/drive/MyDrive/toshiba/標高傾斜度/*zip"
+#raster(path, ['G04d_002','G04d_006','G04d_007'], [np.float32, np.float32, np.int32])
+dx = 0.0025
+dy = 0.003125
+xmin, ymax = 135.0,35.0
+raster(path, ['G04d_002','G04d_006','G04d_007'], [np.float32, np.float32, np.int32], shape=(128,128), transform = from_origin(xmin, ymax, dx, dy))
+
+
+
+ import pandas as pd
+import datetime
+import glob
+from pathlib import Path
+
+def get_amedas_data(date_list, Vars=None, extent=None, data_dir="/home/intern/kaneko/data/amedas"):
+    # === 観測所リスト ===
+    amd_list = pd.read_excel("ame_master.xlsx", sheet_name="ame_master", skiprows=1, index_col=1)
+    amd_list = amd_list[amd_list["風向・風速"] == "Y"]
+
+    if extent is not None:
+        amd_list = amd_list[
+            (amd_list["経度"].between(extent[0], extent[1])) &
+            (amd_list["緯度"].between(extent[2], extent[3]))
+        ]
+
+    station_list = amd_list['管轄'].values + '_' + amd_list['観測所名'].values
+    station_set = set(station_list)
+
+    # === 時刻を文字列化して検索 ===
+    date_strs = [d.strftime("%Y-%m-%d %H:%M:%S") for d in date_list]
+    month_set = {d.strftime("%Y%m") for d in date_list}
+
+    df_all = []
+
+    for month in month_set:
+        # 月フォルダ内のファイルパターンを探索
+        # 月フォルダ内のファイルパターンを探索
+        files = [
+            f for f in glob.glob(str(Path(data_dir) / month / "amd10_*_*.csv"))
+            if f in station_set
+            ]
+
+        for file in files:
+            try:
+                df = pd.read_csv(file, index_col=0, parse_dates=True)
+            except Exception:
+                continue
+
+            # 必要な列だけ残す
+            if Vars is not None:
+                keep_cols = [*Vars]
+                df = df[keep_cols]
+
+            # 日時で抽出
+            df = df[df.index.strftime("%Y-%m-%d %H:%M:%S").isin(date_strs)]
+            if df.empty or df.isnull().any(axis=1).any():
+                continue
+
+            # ファイル名から station 情報を復元
+            fname = Path(file).stem.split("_")
+            pref, name, code = fname[1], fname[2], fname[3]
+
+            meta = amd_list.loc[code] if code in amd_list.index else None
+            if meta is None:
+                continue
+
+            df["name"] = f"{pref}:{name}"
+            df["lat"] = meta["緯度"]
+            df["lon"] = meta["経度"]
+
+            df_all.append(df.reset_index())
+
+    if not df_all:
+        return pd.DataFrame()
+
+    return pd.concat(df_all, ignore_index=True)
