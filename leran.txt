@@ -32,6 +32,24 @@ lon2d, lat2d = np.meshgrid(grid_lon, grid_lat)
 grid_value = griddata(lon,lat), values, (lon2d, lat2d), method="linear", fill_value=)
 
 
+
+geo = pd.read_csv('/home/intern/kaneko/data/標高傾斜度5次メッシュ/20231101/G04d_data.csv')
+geo['AverageElevation'] = pd.to_numeric(geo['AverageElevation'], errors='coerce').astype(np.float32).values
+geo['MaximumSlopeAngle'] = pd.to_numeric(geo['MaximumSlopeAngle'], errors='coerce').astype(np.float32).values
+geo['MaximumSlopeDirection'] = pd.to_numeric(geo['MaximumSlopeDirection'], errors='coerce').astype(Int32).values
+geo['centroid_lon'] = pd.to_numeric(geo['centroid_lon'], errors='coerce').astype(np.float32).values
+geo['centroid_lat'] = pd.to_numeric(geo['centroid_lat'], errors='coerce').astype(np.float32).values
+
+lnd = pd.read_csv('/home/intern/kaneko/data/土地利用細分メッシュ/20231101/L03b_data.csv')
+lnd['land_use_type'] = pd.to_numeric(lnd['land_use_type'], errors='coerce').astype(Int32).values
+lnd['centroid_lon'] = pd.to_numeric(lnd['centroid_lon'], errors='coerce').astype(np.float32).values
+lnd['centroid_lat'] = pd.to_numeric(lnd['centroid_lat'], errors='coerce').astype(np.float32).values
+
+ubn = pd.read_csv('/home/intern/kaneko/data/都市地域土地利用細分メッシュ/20231101/L03bu_data.csv')
+ubn['land_use_type'] = pd.to_numeric(ubn['land_use_type'], errors='coerce').astype(Int32).values
+ubn['centroid_lon'] = pd.to_numeric(ubn['centroid_lon'], errors='coerce').astype(np.float32).values
+ubn['centroid_lat'] = pd.to_numeric(ubn['centroid_lat'], errors='coerce').astype(np.float32).values
+
 def raster(zip_file_path, value_list, dtype_list, shape=None, transform=None):
     path_list = glob.glob(zip_file_path)
 
