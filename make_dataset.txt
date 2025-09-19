@@ -1,0 +1,371 @@
+import pandas as pd
+import numpy as np
+import cartopy.crs as ccrs
+import matplotlib.pyplot as plt
+import torch
+
+from pathlib import Path
+from zipfile import ZipFile
+import geopandas as gpd
+
+import os
+import glob
+import datetime
+from tqdm import tqdm
+
+import rasterio
+from rasterio.transform import from_origin
+from rasterio import features
+from collections import deque
+
+
+def angle_to_xy(r,deg):
+    rad = np.deg2rad(deg)
+    x = r*np.cos(rad)
+    y = r*np.sin(rad)
+    return x, y
+
+def slope_dir_to_xy(arr):
+    # --- 風向変換辞書 ---
+    #0=方向なし、1=北、2=北東、3=東、4=東南、5=南、6=南西、7=西、8=北西）
+    slope_dir_map = {
+        2.: 45.0, 4.: 135.0, 6.: 225.0, 8.: 315.0,
+        1.: 360.0, 3.: 90.0, 5.: 180.0, 7.: 270.0
+    }
+    def map_with_default(x):
+        return slope_dir_map.get(x, np.nan)
+    mapper = np.vectorize(map_with_default)
+    return mapper(arr)
+
+
+def scaler(x, minmax, nan_value=0):   
+    minval, maxval = minmax
+    # ゼロ除算防止
+    if minval == maxval:
+        return np.full_like(x, 0.0)
+
+    # スケーリング
+    scaled = (x - minval) / (maxval - minval)
+
+    # 丸め込み（0〜1 にクリップ）
+    scaled = np.clip(scaled, 0.0, 1.0)
+
+    # NaN を 0 に変換
+    scaled = np.nan_to_num(scaled, nan=nan_value)
+
+    return scaled
+
+
+def scaler_lnd(arr):
+    scaler = {
+        '0100': 0.3, #田
+        '0200': 0.3, #その他の農用地
+        '0500': 0.8, #森林
+        '0600': 0.2, #荒地
+        '0701': 1., #中高層建物
+        '0702': 0.9, #工場
+        '0703': 0.7, #低層建物（非密集地）
+        '0704': 0.7, #低層建物（密集地）
+        '0901': 0.5, #道路
+        '0902': 0.5, #鉄道
+        '1001': 0.6, #施設等用地
+        '1002': 0.2, #空地
+        '1003': 0.2, #公園・緑地
+        '1100': 0.1, #河川地及び湖沼
+        '1400': 0., #海浜
+        '1500': 0., #海水域
+        '1600': 0.2, #ゴルフ場
+        '0000': 0., #解析範囲外
+            }
+
+    # ベクトル化関数（辞書にない値は 0.0 を返す）
+    vectorized = np.vectorize(lambda x: scaler.get(x, 0.0))
+    
+    return vectorized(arr)
+
+    
+    
+
+def raster(zip_file_path, value_list, dtype_list, epsg, shape, transform):
+    path_list = glob.glob(zip_file_path)
+
+    gdfs = []
+    for path in tqdm(path_list):
+        zf = ZipFile(path)
+        shp = [f for f in zf.namelist() if f.endswith(".shp")]
+        gdf = gpd.read_file("zip://"+path+"/"+shp[0])
+        # EPSG:4612 → JGD2000 / (B, L) （地理座標系、2D: lon, lat）
+        # EPSG:6697 → JGD2011 / (B, L)
+
+        gdf.crs = epsg
+        gdf = gdf.replace("unknown", np.nan)
+        gdfs.append(gdf)
+        #print(gdf.columns)
+
+    gdf_all = gpd.GeoDataFrame(pd.concat(gdfs, ignore_index=True))
+
+    raster_list = []
+    for value, dtype in zip(value_list, dtype_list):
+        gdf_all[value] = gdf_all[value].astype(dtype)
+        # 各ポリゴンに土地利用コードを割り当てる
+        shapes = ((geom, val) for geom, val in zip(gdf_all.geometry, gdf_all[value]))
+
+        raster = features.rasterize(
+            shapes=shapes,
+            out_shape=shape,
+            transform=transform,
+            fill=np.nan,        # 空白部分は0
+            dtype=dtype
+            )
+        raster = np.flip(raster, axis=0)
+        print(raster.shape)
+        raster_list.append(raster)
+    return raster_list
+
+
+def geo_getter(lon, lat, shape, transform, check=False):
+    path1 = '../data/標高傾斜度5次メッシュ/*zip'
+    path2 = '../data/土地利用細分メッシュ/*zip'
+    path3 = '../data/都市地域土地利用細分メッシュ/*zip'
+
+    value_list1 = ['G04d_002','G04d_006','G04d_007']
+    value_list2 = ['L03b_002']
+    value_list3 = ['L03b_u_002']
+
+    dtype_list1 = [np.float32, np.float32, np.float32]
+    dtype_list2 = [np.float32]
+    dtype_list3 = [np.float32]
+
+    # JGD2000, TP / （B, L）, H  EPSG:6697
+    # JGD2000, TP / （B, L）  EPSG:4612
+    epsg1 = 'EPSG:6697'
+    # JGD2011/ （B, L）  EPSG:6697
+    epsg2 = 'EPSG:6697'
+    epsg3 = 'EPSG:6697'
+
+    [elev, slope_ang, slope_dir] = raster(path1, value_list1, dtype_list1, epsg1, shape, transform)
+    [lnd] = raster(path2, value_list2, dtype_list2, epsg2, shape, transform)
+    [ubn] = raster(path3, value_list3, dtype_list3, epsg3, shape, transform)
+
+    # 確認
+    if check:
+        for value, name in zip([elev, slope_ang, slope_dir, lnd, ubn], ['elev', 'slope_ang', 'slope_dir', 'lnd', 'ubn']):
+            print(lon.shape, lat.shape, value.shape, np.nanmin(value), np.nanmax(value))
+            fig = plt.figure()
+            ax = fig.add_subplot(1, 1, 1, projection=ccrs.PlateCarree()) 
+            ax.coastlines(linewidth=1.5)
+            C = ax.contourf(lon, lat, value, cmap='bwr',transform=ccrs.PlateCarree())
+            fig.colorbar(C,cax=plt.axes((0.9,0.2,0.02,0.6)),orientation="vertical")
+            fig.savefig(f'tmp_{name}.png')
+            plt.close(fig)
+
+    ubn = np.where(np.isnan(ubn), lnd, ubn)
+    slope_x, slope_y = angle_to_xy(1,slope_dir_to_xy(slope_dir))
+
+    #　正規化
+    elev = scaler(elev, minmax_elev)
+    slope_x = scaler(slope_x, [-1,1], 0.5)
+    slope_y = scaler(slope_y, [-1,1], 0.5)
+    ubn = scaler_lnd(ubn)
+
+    
+    elev = elev.reshape(1,shape[0], shape[1])
+    slope_x = slope_x.reshape(1,shape[0], shape[1])
+    slope_y = slope_y.reshape(1,shape[0], shape[1])
+    ubn = ubn.reshape(1,shape[0], shape[1])
+
+    geo = np.concatenate([elev, slope_x, slope_y, ubn], axis=0)
+    print(geo.shape, np.min(geo), np.max(geo))
+    return geo
+
+
+
+extent=[136,138,34,36]
+minmax_elev = [0,1000]
+minmax_w = [-20,20]
+
+def get_geo(extent, dx, dy, check=False):
+    width = int((extent[1] - extent[0]) / dx)
+    height = int((extent[3] - extent[2]) / dy)
+    shape = (height, width)
+    print(shape)
+    transform = from_origin(extent[0], extent[3], dx, dy)
+
+    lon = np.array([extent[0]+dx*i for i in range(width)])
+    lat = np.array([extent[2]+dy*i for i in range(height)])
+    lon, lat = np.meshgrid(lon, lat)
+    print(lon.shape, lat.shape)
+
+    geo = geo_getter(lon, lat, shape, transform, check)
+
+    return lon, lat, geo
+
+dx = 0.010
+dy = 0.01250
+lon1, lat1, geo1 = get_geo(extent, dx, dy, check=True)
+np.save('data/geo1.npy', geo1)
+np.save('data/lon1.npy', lon1)
+np.save('data/lat1.npy', lat1)
+
+
+dx = 0.0025
+dy = 0.003125
+lon2, lat2, geo2 = get_geo(extent, dx, dy, check=False)
+np.save('data/geo2.npy', geo2)
+np.save('data/lon2.npy', lon2)
+np.save('data/lat2.npy', lat2)
+
+del geo1,geo2,lon1,lat1,lon2,lat2
+
+def get_amedas_data(date_list, Vars=None, extent=None):
+    data_dir = '../data/amedas/'
+    # === 観測所リスト ===
+    amd_list = pd.read_excel(data_dir+"ame_master.xlsx", sheet_name="ame_master", skiprows=1, index_col=1)
+    amd_list = amd_list[amd_list["風向・風速"] == "Y"]
+
+    if extent is not None:
+        amd_list = amd_list[
+            (amd_list["経度"].between(extent[0], extent[1])) &
+            (amd_list["緯度"].between(extent[2], extent[3]))
+        ]
+
+    station_list = amd_list['都府県振興局'].values + '_' + amd_list['観測所名'].values
+    station_set = set(station_list)
+
+    # === 時刻を文字列化して検索 ===
+    date_strs = [d.strftime("%Y-%m-%d %H:%M:%S") for d in date_list]
+    month_set = {d.strftime("%Y%m") for d in date_list}
+
+    df_all = []
+
+    for month in month_set:
+        files = [
+            f for f in glob.glob(str(Path(data_dir) / month / "amd10_*.csv"))
+            if any(key in f for key in station_set)
+            ]
+
+        for file in files:
+            try:
+                df = pd.read_csv(file, index_col=0, parse_dates=True)
+            except Exception:
+                continue
+
+            # 必要な列だけ残す
+            if Vars is not None:
+                df = df[Vars]
+
+            # 日時で抽出
+            df = df[df.index.strftime("%Y-%m-%d %H:%M:%S").isin(date_strs)]
+            if df.empty:
+                continue
+
+            # ファイル名から station 情報を復元
+            fname = Path(file).stem.split("_")
+            pref, name = fname[1], fname[2]
+
+            meta = amd_list[(amd_list['都府県振興局']==pref) & (amd_list['観測所名']==name)]
+            if meta is None:
+                continue
+            #print(meta[['観測所名','緯度','経度']])
+
+            df["name"] = f"{pref}:{name}"
+            df["lat"] = meta["緯度"].values[0]
+            df["lon"] = meta["経度"].values[0]
+
+            df_all.append(df.reset_index())
+
+    if not df_all:
+        return pd.DataFrame()
+
+    return pd.concat(df_all, ignore_index=True)
+
+def amd_to_meshgrid(df, lons, lats):
+
+    value = np.zeros((2, *lons.shape))
+    
+    def find_index(lat1, lon1):
+        dist = np.sqrt((lats - lat1)**2 + (lons - lon1)**2)
+        idx_flat = dist.argmin()
+        i, j = np.unravel_index(idx_flat, lats.shape)
+        return i, j
+        
+    idx = []
+    for _, row in df.iterrows():
+        i, j = find_index(row['lat'], row['lon'])
+        #print(row['U'], row['V'], row['lat'], row['lon'])
+        value[0, i, j] = row['U']
+        value[1, i, j] = row['V']
+        if (~pd.isna(row['U'])) & (~pd.isna(row['V'])):
+            idx.append([i,j])
+    return value, idx
+
+    
+
+def amd_getter(date_list, dt, extent, lon, lat, n=4):
+    amd_list = get_amedas_data(date_list, Vars=['WS_MEAN', 'WD_MEAN'], extent=extent)
+
+    #print(np.unique(amd_list['WD_MEAN'].values))
+    amd_list['U'], amd_list['V'] = angle_to_xy(amd_list['WS_MEAN'].values, amd_list['WD_MEAN'].values)
+    amd_list['DATE'] = pd.to_datetime(amd_list['DATE'])
+    print(amd_list)
+
+    amd = np.zeros((len(date_list),n,2,*lon1.shape))
+
+    all_values = []
+    idxs = []
+    buffer = deque(maxlen=n)
+    prev_time = None
+
+    # 時刻順にグループ化
+    for time, amd_list_t in tqdm(sorted(amd_list.groupby('DATE')), total=len(amd_list.groupby('DATE'))):
+        # 時間差が不正 → バッファクリア
+        if prev_time is not None and (time - prev_time) != dt:
+            buffer.clear()
+
+        value, idx = amd_to_meshgrid(amd_list_t, lon1, lat1)  # shape: (2, H, W)
+
+        # 全部 0 → 欠損とみなしてバッファクリア
+        if np.nanmax(value) == 0:
+            buffer.clear()
+            prev_time = time
+            continue
+
+        buffer.append(value)
+
+        # 十分にたまったら保存（ここで重複を許す）
+        if len(buffer) == n:
+            stacked = np.stack(buffer, axis=0)  # shape: (n, 2, H, W)
+            all_values.append(torch.from_numpy(scaler(stacked.copy(), minmax_w, 0.5)).float())
+            idxs.append(idx)
+
+        prev_time = time  # 次の比較のために更新
+
+    #result = np.stack(all_values, axis=0)  # shape: (num, n, 2, H, W)
+    #print(result.shape)
+    result = all_values
+    return result, idxs
+
+lon1 = np.load('data/lon1.npy', allow_pickle=True)
+lat1 = np.load('data/lat1.npy', allow_pickle=True)
+
+start_list = [datetime.datetime(2020,1,1,0,0), 
+              datetime.datetime(2021,1,1,0,0), 
+              datetime.datetime(2022,1,1,0,0), 
+              datetime.datetime(2023,1,1,0,0), 
+              datetime.datetime(2024,1,1,0,0)]
+end_list = [datetime.datetime(2021,1,1,0,0),
+            datetime.datetime(2022,1,1,0,0),
+            datetime.datetime(2023,1,1,0,0),
+            datetime.datetime(2024,1,1,0,0),
+            datetime.datetime(2025,1,1,0,0)]
+for start, end in zip(start_list, end_list):
+    dt = datetime.timedelta(minutes=10)
+    date_list = [start+dt*i for i in range((end-start)//dt)]
+    print(f'{date_list[0].strftime("%Y%m")}_{date_list[-1].strftime("%Y%m")}')
+    amd, idxs = amd_getter(date_list, dt, extent, lon1, lat1)
+    #amd = scaler(amd, minmax_w, 0.5)
+    print(np.min(amd), np.max(amd))
+    #np.save(f'data/amd_{date_list[0].strftime("%Y%m")}_{date_list[-1].strftime("%Y%m")}.npy', amd)
+    torch.save({'amd':amd, 'idxs':idxs}, f'data/amd_{date_list[0].strftime("%Y%m")}_{date_list[-1].strftime("%Y%m")}.pkl')
+
+    del amd
